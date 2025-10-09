@@ -82,6 +82,7 @@ The data loading process has two main stages of caching
   * **Process:** It loads the preprocessed full-brain data session-by-session, applies the ROI mask to extract the relevant voxels, and saves all samples into a **single, final cache file**.
   * **Time/Resource Cost:**
       * **Time:** \~15 minutes for the largest ROIs (e.g., `general`).
+      * **Peak RAM:** \~25 GB.
 
 Once the ROI-specific cache is built, any future experiment using that same ROI will load almost instantly
 

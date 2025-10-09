@@ -2,7 +2,7 @@
 #SBATCH --time=30:00
 #SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=20g
+#SBATCH --mem=25g
 #SBATCH --tmp=10g
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=lee02328@umn.edu
