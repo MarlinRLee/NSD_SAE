@@ -1,0 +1,19 @@
+# For data loading and deep learning
+torch
+pydantic
+
+# For neuroimaging data handling
+nibabel
+nilearn
+
+# For data manipulation and scientific computing
+numpy
+pandas
+scipy
+h5py
+
+# For image handling
+Pillow
+
+# For progress bars in scripts
+tqdm

@@ -1,0 +1,4 @@
+nsddata/
+slurm*.out
+lightning_logs/
+__pycache__/
