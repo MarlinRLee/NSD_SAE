@@ -50,13 +50,14 @@ def main(args):
         batch_size=args.batch_size,
         num_workers=args.workers,
         shuffle=True,
-        pin_memory=True  # Good practice for GPU training
+        pin_memory=True,
+        persistent_workers=True
     )
     print(f"✅ DataLoader created with {len(dataset)} samples.")
 
     # 2. Setup Model
     # Get the input dimension directly from the created dataset
-    input_dim = dataset[0]['fmri'].shape[0]
+    input_dim = dataset.data['fmri'].shape[1]
     nb_concepts = int(input_dim * args.expansion_factor)
     
     model = TopKSAE(
@@ -72,14 +73,18 @@ def main(args):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # This helper adapts our dictionary-based loader to the tuple-based format train_sae expects
-    def get_tensor_iterator(dataloader, device):
-        for batch in dataloader:
-            yield (batch['fmri'].to(device),)
+    class TensorIteratorWrapper:
+        """A wrapper to make the dict-based DataLoader a reusable iterable of tensors."""
+        def __init__(self, dataloader, device):
+            self.dataloader = dataloader
+            self.device = device
 
-    tensor_loader = get_tensor_iterator(train_loader, device)
+        def __iter__(self):
+            for batch in self.dataloader:
+                yield (batch['fmri'].to(self.device),)
     
     # 4. Run Profiling and Training
-    print(f"\n🔥 Starting training for {args.epochs} epoch(s)...")
+    tensor_loader = TensorIteratorWrapper(train_loader, device)
     
     profiler = cProfile.Profile()
     profiler.enable()
@@ -127,10 +132,10 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=4, help="Number of worker processes for data loading.")
     
     # Model and Training arguments
-    parser.add_argument("--expansion_factor", type=float, default=0.01, help="Factor to determine nb_concepts (nb_concepts = input_dim * expansion_factor).")
-    parser.add_argument("--top_k", type=int, default=32, help="Number of concepts to activate (k in Top-K).")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train for.")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for the Adam optimizer.")
+    parser.add_argument("--expansion_factor", type=float, default=1, help="Factor to determine nb_concepts (nb_concepts = input_dim * expansion_factor).")
+    parser.add_argument("--top_k", type=int, default=1570, help="Number of concepts to activate (k in Top-K).")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs to train for.")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate for the Adam optimizer.")
     
     args = parser.parse_args()
     main(args)

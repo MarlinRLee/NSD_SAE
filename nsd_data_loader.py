@@ -22,18 +22,25 @@ import gc
 TR_s = 4 / 3
 
 
+
+
 class NSDDataset(torch.utils.data.Dataset):
     """
-    A Dataset that holds individual fMRI time steps as samples.
+    A Dataset that holds fMRI time steps.
     """
-    def __init__(self, samples: list[dict], img_path: Path):
-        self.samples = samples
-        self.stim_file = None
+    def __init__(self, cached_data: dict[str, torch.Tensor], img_path: Path):
+        self.data = cached_data
         self.stimuli_path = img_path
-
+        self.stim_file = None
+        self.img_brick = None
 
     def __len__(self) -> int:
-        return len(self.samples)
+        # Get length from the first dimension of the fmri tensor
+        return self.data["fmri"].shape[0]
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        # Slicing every tensor in the data dictionary is fast and correct.
+        return {key: tensor[idx] for key, tensor in self.data.items()}
 
     def _open_stim_file(self):
         """Opens the HDF5 file and gets the imgBrick dataset."""
@@ -41,22 +48,74 @@ class NSDDataset(torch.utils.data.Dataset):
             self.stim_file = h5py.File(self.stimuli_path, 'r')
             self.img_brick = self.stim_file['imgBrick']
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        sample = self.samples[idx]
-        return {
-            "fmri": torch.from_numpy(sample["fmri"]).float(),
-            "stimulus_history": torch.tensor(sample["stimulus_history"], dtype=torch.long),
-            "time_since_last_stimulus": torch.tensor(sample["time_since_last_stimulus"], dtype=torch.long),
-            "subject_idx": torch.tensor(sample["subject_idx"], dtype=torch.long),
-        }
+    def __get_image__(self, idx: int) -> Image.Image:
+        """
+        Special method to retrieve a PIL image from the HDF5 brick.
+        """
+        self._open_stim_file()  # Ensure the HDF5 file is open
+        image_data = self.img_brick[idx]
+        return Image.fromarray(image_data)
 
-    def __get_image__(self, idx: int) -> tp.Union[dict, Image.Image]:
-            """
-            Special method to retrieve a PIL image from the HDF5 brick.
-            """
-            self._open_stim_file()  # Ensure the HDF5 file is open
-            image_data = self.img_brick[idx]
-            return Image.fromarray(image_data)
+    def get_sequence_item(self, idx: int) -> tp.Optional[dict[str, torch.Tensor]]:
+        """
+        Finds the full 6-sample sequence and corresponding image for a given
+        timestep index.
+        """
+        
+        # 1. Identify stimulus ID from the history tensor. Use .item() to get Python numbers.
+        stim_id = self.data['stimulus_history'][idx][-1].item()
+        
+        if stim_id == -1:
+            print("No prior images seen for this timestep (resting state).")
+            return None
+        
+        target_run = self.data['run'][idx].item()
+        target_session = self.data['session'][idx].item()
+
+        # 2. Search backwards to find the start of the sequence.
+        sequence_start_index = -1
+        for i in range(idx, -1, -1):
+            current_run = self.data['run'][i].item()
+            current_session = self.data['session'][i].item()
+            
+            # Stop if we cross a run/session boundary.
+            if current_run != target_run or current_session != target_session:
+                sequence_start_index = i + 1
+                break
+            
+            # Stop when the stimulus ID changes. The next sample is the start.
+            current_stim_id = self.data['stimulus_history'][i][-1].item()
+            if current_stim_id != stim_id:
+                sequence_start_index = i + 1
+                break
+            
+            # Handle the case where the sequence starts at the very beginning.
+            if i == 0:
+                sequence_start_index = 0
+                break
+        
+        # 3. Define the 6-sample slice and check its boundaries.
+        sequence_end_index = sequence_start_index + 6
+        if sequence_end_index > len(self):
+            return None # Sequence is truncated at the end of the dataset.
+
+        # Ensure the sequence does not cross a run boundary.
+        last_sample_run = self.data['run'][sequence_end_index - 1].item()
+        last_sample_session = self.data['session'][sequence_end_index - 1].item()
+        if last_sample_run != target_run or last_sample_session != target_session:
+            return None # Sequence is truncated by the end of the run.
+
+        # 4. Extract data and format it into the desired dictionary.
+        # This is now a simple, fast tensor slice!
+        fmri = self.data['fmri'][sequence_start_index:sequence_end_index]
+        
+        image_pil = self.__get_image__(stim_id)
+        image = torch.from_numpy(np.array(image_pil)).permute(2, 0, 1).float() / 255.0
+
+        subject_id = self.data['subject_idx'][idx] # Already a tensor
+        
+        return {"brain": fmri, "img": image, "subject_idx": subject_id}
+
 
 class NsdSaeDataConfig(pydantic.BaseModel):
     """
@@ -144,13 +203,13 @@ class NsdSaeDataConfig(pydantic.BaseModel):
                             last_event_id = current_event_id
                             time_of_last_event = t
 
-                    time_since_last = t - time_of_last_event if time_of_last_event is not None else -1
-                    
                     sample = {
                         "fmri": run_fmri_data[..., t],
                         "stimulus_history": list(stimulus_history_queue),
-                        "time_since_last_stimulus": time_since_last,
                         "subject_idx": self.subject_id,
+                        "session": session,
+                        "run": run,
+                        "time": t,
                     }
                     session_samples.append(sample)
             
@@ -160,70 +219,83 @@ class NsdSaeDataConfig(pydantic.BaseModel):
             gc.collect()
             print(f"✅ Saved preprocessed data for session {session:02d}")
 
-    def _create_roi_cache(self, preproc_dir: Path, roi_cache_path: Path) -> list[dict]:
+    def _create_roi_cache(self, preproc_dir: Path, roi_cache_path: Path) -> dict:
         """
         Creates a specific cache for an ROI by loading preprocessed full-brain data,
-        applying the ROI mask, and saving the result. This is much faster than
-        reprocessing from scratch.
+        applying the ROI mask, stacking all data into large tensors, and saving the result.
         """
         roi_name = Path(self.roi).name
         print(f"Creating new cache for ROI '{roi_name}' at {roi_cache_path}", flush=True)
 
         roi_path = Path(self.roi)
-
         roi_mask = nibabel.load(roi_path, mmap=True).get_fdata() > 0
         
-        all_roi_samples = []
-        session_files = sorted(preproc_dir.glob("session_*.pt"))
+        # Use lists to collect data before stacking
+        all_fmri = []
+        all_stim_hist = []
+        all_subj_idx = []
+        all_session = []
+        all_run = []
+        all_time = []
 
+        session_files = sorted(preproc_dir.glob("session_*.pt"))
         print(f"Found {len(session_files)} preprocessed session files. Applying ROI...", flush=True)
         for session_filepath in session_files:
-            print(session_filepath, flush = True)
             session_samples = torch.load(session_filepath)
             for sample in session_samples:
-                full_brain_fmri = sample["fmri"]
-                sample["fmri"] = full_brain_fmri[roi_mask]
-                all_roi_samples.append(sample)
+                # Append numpy arrays and python scalars, which is fast
+                all_fmri.append(sample["fmri"][roi_mask])
+                all_stim_hist.append(sample["stimulus_history"])
+                all_subj_idx.append(sample["subject_idx"])
+                all_session.append(sample["session"])
+                all_run.append(sample["run"])
+                all_time.append(sample["time"])
             del session_samples
             gc.collect()
-        
-        print(f"Saving {len(all_roi_samples)} ROI-specific samples to cache...", flush=True)
-        torch.save(all_roi_samples, roi_cache_path)
+
+        print(f"Stacking {len(all_fmri)} samples into tensors...", flush=True)
+        # Convert lists into single, large tensors
+        cached_data = {
+            "fmri": torch.from_numpy(np.array(all_fmri, dtype=np.float32)),
+            "stimulus_history": torch.tensor(all_stim_hist, dtype=torch.long),
+            "subject_idx": torch.tensor(all_subj_idx, dtype=torch.long),
+            "session": torch.tensor(all_session, dtype=torch.long),
+            "run": torch.tensor(all_run, dtype=torch.long),
+            "time": torch.tensor(all_time, dtype=torch.float),
+        }
+
+        print(f"Saving consolidated ROI-specific data to cache...", flush=True)
+        torch.save(cached_data, roi_cache_path)
         print(f"✅ Saved ROI cache: {roi_cache_path}", flush=True)
         
-        return all_roi_samples
+        return cached_data
 
-    def build(self, roi: str= "") -> NSDDataset:
+    def build(self, roi: str= "") -> 'NSDDataset':
         """
         Orchestrates data loading and caching. It creates an ROI-specific cache 
         on demand from preprocessed full-brain data.
         """
         self.roi = roi
         img_path = Path(self.nsddata_path).resolve() / "nsd_stimuli.hdf5"
-
-        # 1. Determine the final, ROI-specific cache path
         roi_cache_filepath = self._get_roi_cache_filepath()
 
-        # 2. Check if this specific ROI cache already exists
         if roi_cache_filepath.exists():
             print(f"✅ Loading cached ROI data from: {roi_cache_filepath}", flush=True)
-            final_samples = torch.load(roi_cache_filepath)
+            final_data = torch.load(roi_cache_filepath)
         else:
             print(f"ROI cache not found. Attempting to build it.", flush=True)
             preproc_dir = self._get_preproc_dir_path()
-            
-            # 3. If not, check for the base preprocessed full-brain data
             if not preproc_dir.exists() or not any(preproc_dir.iterdir()):
-                # 4. If preprocessed data doesn't exist, create it from scratch
                 self._preprocess_full_brain(preproc_dir)
             else:
                 print(f"Found existing preprocessed data at {preproc_dir}", flush=True)
-
-            # 5. Now that preprocessed data exists, create the specific ROI cache from it
-            final_samples = self._create_roi_cache(preproc_dir, roi_cache_filepath)
+            final_data = self._create_roi_cache(preproc_dir, roi_cache_filepath)
         
-        print(f"Dataset ready. Voxel count per sample: {final_samples[0]['fmri'].shape[0]}", flush=True)
-        return NSDDataset(samples=final_samples, img_path=img_path)
+        # Correctly get voxel count from the stacked fmri tensor's second dimension
+        print(f"Dataset ready. Voxel count per sample: {final_data['fmri'].shape[1]}", flush=True)
+        
+        # Pass the dictionary of tensors to the corrected NSDDataset constructor
+        return NSDDataset(cached_data=final_data, img_path=img_path)
 
 
 def create_nsd_dataloader(

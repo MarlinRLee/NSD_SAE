@@ -1,13 +1,13 @@
 #!/bin/bash -l
-#SBATCH --time=30:00
+#SBATCH --time=1:00:00
 #SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=25g
+#SBATCH --mem=30g
 #SBATCH --tmp=10g
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=lee02328@umn.edu
-#fake SBATCH -p a100-4
-#fake SBATCH --gres=gpu:a100:1
+#SBATCH -p a100-4
+#SBATCH --gres=gpu:a100:1
 
 module purge
 
