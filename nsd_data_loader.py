@@ -281,7 +281,7 @@ class NsdSaeDataConfig(pydantic.BaseModel):
         # 2. Check if this specific ROI cache already exists
         if roi_cache_filepath.exists():
             print(f"✅ Loading cached ROI data from: {roi_cache_filepath}", flush=True)
-            final_samples = torch.load(roi_cache_filepath)
+            final_samples = torch.load(roi_cache_filepath, weights_only = False)
         else:
             print(f"ROI cache not found. Attempting to build it.", flush=True)
             preproc_dir = self._get_preproc_dir_path()
