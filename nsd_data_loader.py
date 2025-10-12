@@ -33,7 +33,7 @@ class NSDDataset(torch.utils.data.Dataset):
         self.stim_file = None
         self.stimuli_path = img_path
         self.return_fmri_only = return_fmri_only
-        print(samples.shape, flush=True)
+        print(len(samples), flush=True)
     def __len__(self) -> int:
         return len(self.samples)
 
