@@ -253,7 +253,7 @@ class NsdSaeDataConfig(pydantic.BaseModel):
         print(f"Found {len(session_files)} preprocessed session files. Applying ROI...", flush=True)
         for session_filepath in session_files:
             print(session_filepath, flush = True)
-            session_samples = torch.load(session_filepath)
+            session_samples = torch.load(session_filepath, weights_only = False)
             for sample in session_samples:
                 full_brain_fmri = sample["fmri"]
                 sample["fmri"] = full_brain_fmri[roi_mask]
