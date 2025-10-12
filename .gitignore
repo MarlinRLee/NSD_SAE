@@ -2,3 +2,5 @@ nsddata/
 slurm*.out
 lightning_logs/
 __pycache__/
+*.png
+dynadiff_sample.pth
