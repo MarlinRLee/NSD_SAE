@@ -46,7 +46,7 @@ class NSDDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> tp.Union[torch.Tensor, dict[str, torch.Tensor]]:
         sample = self.samples[idx]
         fmri_tensor = torch.from_numpy(sample["fmri"]).float()
-        fmri_tensor = fmri_tensor / fmri_tensor.shape[1]#norm fmri features for processing
+        fmri_tensor = fmri_tensor# / fmri_tensor.shape[0]#norm fmri features for processing
 
         if self.return_fmri_only:
             return fmri_tensor
