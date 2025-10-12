@@ -26,7 +26,7 @@ def main(args):
     print(f"  Num Workers:        {args.workers}")
     print(f"  Training Epochs:    {args.epochs}")
     print(f"  Expansion Factor:   {args.expansion_factor}")
-    print(f"  Top-K:              {args.top_k}")
+    print(f"  sparsity:              {args.sparsity}")
     print(f"  Learning Rate:      {args.lr}")
     print(f"  NSD Data Path:      '{args.nsddata_path}'")
     print(f"  ROI Path:           '{args.roi_path}'")
@@ -40,8 +40,8 @@ def main(args):
     config = NsdSaeDataConfig(nsddata_path=args.nsddata_path, subject_id=args.subject_id)
     
     print("🚀 Initializing and building dataset...")
-    # Directly build the dataset using the configuration object
-    dataset = config.build(roi=args.roi_path)
+    # Directly build the dataset, telling it to return only fMRI tensors
+    dataset = config.build(roi=args.roi_path, return_fmri_only=True)
     print("✅ Dataset initialized.")
     
     # Create a standard PyTorch DataLoader
@@ -57,34 +57,21 @@ def main(args):
 
     # 2. Setup Model
     # Get the input dimension directly from the created dataset
-    input_dim = dataset.data['fmri'].shape[1]
+    input_dim = dataset.samples[0]['fmri'].shape[0]
     nb_concepts = int(input_dim * args.expansion_factor)
-    
+    top_k = int(nb_concepts * args.sparsity)
     model = TopKSAE(
         input_dim,
         nb_concepts=nb_concepts,
-        top_k=args.top_k,
+        top_k = top_k,
         device=device
-    ).float()
+    ).half()
     
-    print(f"✅ TopKSAE Model initialized with input_dim={input_dim}, nb_concepts={nb_concepts}, top_k={args.top_k}")
+    print(f"✅ TopKSAE Model initialized with input_dim={input_dim}, nb_concepts={nb_concepts}, top_k={top_k}")
 
     # 3. Setup Optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    # This helper adapts our dictionary-based loader to the tuple-based format train_sae expects
-    class TensorIteratorWrapper:
-        """A wrapper to make the dict-based DataLoader a reusable iterable of tensors."""
-        def __init__(self, dataloader, device):
-            self.dataloader = dataloader
-            self.device = device
-
-        def __iter__(self):
-            for batch in self.dataloader:
-                yield (batch['fmri'].to(self.device),)
-    
-    # 4. Run Profiling and Training
-    tensor_loader = TensorIteratorWrapper(train_loader, device)
     
     profiler = cProfile.Profile()
     profiler.enable()
@@ -93,7 +80,7 @@ def main(args):
     
     train_sae(
         model,
-        tensor_loader,
+        train_loader,
         criterion,
         optimizer,
         nb_epochs=args.epochs,
@@ -126,14 +113,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Profile the NSD SAE DataLoader with a TopKSAE model.")
     # Data loading arguments
     parser.add_argument("--nsddata_path", type=str, default = "nsddata", help="Path to the root of the NSDdata directory.")
-    parser.add_argument("--roi_path", type=str, default = "nsddata/nsddata/ppdata/subj01/func1pt8mm/roi/nsdgeneral.nii.gz", help="Path to the .nii.gz ROI file.")
+    parser.add_argument("--roi_path", type=str, default = "nsddata/nsddata/ppdata/subj01/func1pt8mm/roi/streams.nii.gz", help="Path to the .nii.gz ROI file.")
     parser.add_argument("--subject_id", type=int, default=1, help="Subject ID to process (e.g., 1).")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size for the DataLoader.")
     parser.add_argument("--workers", type=int, default=4, help="Number of worker processes for data loading.")
     
     # Model and Training arguments
-    parser.add_argument("--expansion_factor", type=float, default=1, help="Factor to determine nb_concepts (nb_concepts = input_dim * expansion_factor).")
-    parser.add_argument("--top_k", type=int, default=1570, help="Number of concepts to activate (k in Top-K).")
+    parser.add_argument("--expansion_factor", type=float, default=2, help="Factor to determine nb_concepts (nb_concepts = input_dim * expansion_factor).")
+    parser.add_argument("--sparsity", type=int, default=.1, help="Number of concepts to activate (k in sparsity).")
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs to train for.")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate for the Adam optimizer.")
     
