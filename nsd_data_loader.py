@@ -41,6 +41,9 @@ class NSDDataset(torch.utils.data.Dataset):
         print(f"Dataset initialized with {self._length} samples", flush=True)
         print(f"Voxel count per sample: {self.fmri_data.shape[1]}", flush=True)
     
+    def change_return_type(return_fmri_only: bool):
+        self.return_fmri_only = return_fmri_only
+
     def __len__(self) -> int:
         return self._length
     
@@ -234,22 +237,48 @@ class NsdSaeDataConfig(pydantic.BaseModel):
     
     def preprocess_full_brain(self, preproc_dir: Path):
         """
-        Process fMRI data and save to HDF5 files with streaming to minimize RAM usage.
+        Process fMRI data and save to HDF5 files
         """
-        if preproc_dir.exists() and any(preproc_dir.iterdir()):
-            print(f"Found existing preprocessed data at {preproc_dir}", flush=True)
-            return
-        
-        print(f"Processing full-brain data into {preproc_dir}...", flush=True)
         preproc_dir.mkdir(exist_ok=True, parents=True)
+        
+        # 1. Identify all expected session files
+        expected_session_files = {preproc_dir / f"session_{session:02d}.h5" for session in range(1, 41)}
+        
+        # 2. Check the existence of each file
+        existing_session_files = {f for f in expected_session_files if f.exists()}
+        
+        num_existing = len(existing_session_files)
+        num_expected = len(expected_session_files)
+
+        # 3. Determine the state of the cache
+        if num_existing == num_expected:
+            print(f"Found all {num_expected} preprocessed session files at {preproc_dir}. Skipping creation.", flush=True)
+            return
+
+        elif 0 < num_existing < num_expected:
+            # 4. Case: Subset missing, print warning
+            missing_files = expected_session_files - existing_session_files
+            print("WARNING: Full-brain cache is partially built.", flush=True)
+            print(f"Missing {len(missing_files)} of {num_expected} session files (e.g., {next(iter(missing_files)).name}). Rebuilding or completing the cache.", flush=True)
+            
+        elif num_existing == 0:
+            print(f"No existing preprocessed full-brain data found at {preproc_dir}. Starting creation.", flush=True)
+
+        # Proceed with creation/completion of the cache
+        print(f"Processing full-brain data into {preproc_dir}...", flush=True)
         
         nsddata_path = Path(self.nsddata_path).resolve()
         subject_to_14run_sessions = {1: (21, 38), 5: (21, 38), 2: (21, 30), 7: (21, 30)}
         offset_in_TRs = int(round(self.offset / TR_s))
         
         for session in range(1, 41):
-            print(f"\nProcessing session {session:02d}", flush=True)
             session_filepath = preproc_dir / f"session_{session:02d}.h5"
+            
+            # Skip session if the file already exists (handles partial build completion)
+            if session_filepath.exists():
+                continue
+                
+            print(f"\nProcessing session {session:02d}", flush=True)
             
             runs_range = (
                 range(2, 14)
@@ -266,17 +295,25 @@ class NsdSaeDataConfig(pydantic.BaseModel):
                 
                 # Load stimulus info
                 path_to_df = nsddata_path / f"nsddata_timeseries/ppdata/subj{self.subject_id:02d}/func1pt8mm/design/design_{run_id}.tsv"
-                im_ids = pd.read_csv(path_to_df, header=None).iloc[:, 0]
+                try:
+                    im_ids = pd.read_csv(path_to_df, header=None).iloc[:, 0]
+                except FileNotFoundError:
+                    print(f"Design file not found for {run_id}. Skipping run.", flush=True)
+                    continue
                 
                 # Load and process fMRI data
                 nifti_fp = nsddata_path / f"nsddata_timeseries/ppdata/subj{self.subject_id:02d}/func1pt8mm/timeseries/timeseries_{run_id}.nii.gz"
-                nifti = nibabel.load(nifti_fp, mmap=True)
-                
+                try:
+                    nifti = nibabel.load(nifti_fp, mmap=True)
+                except FileNotFoundError:
+                    print(f"Nifti file not found for {run_id}. Skipping run.", flush=True)
+                    continue
+
                 nifti_data_T = nifti.get_fdata(dtype=np.float16)[..., :NUM_TRS_PER_RUN].T
                 shape = nifti_data_T.shape
                 n_voxels = np.prod(shape[1:])
                 
-                # Initialize HDF5 file on first run
+                # Initialize HDF5 file on first run *of this session*
                 if first_run:
                     estimated_samples = len(runs_range) * NUM_TRS_PER_RUN
                     self._create_session_hdf5(session_filepath, n_voxels, estimated_samples)
@@ -342,7 +379,8 @@ class NsdSaeDataConfig(pydantic.BaseModel):
                 del run_fmri_data
                 gc.collect()
             
-            print(f"Saved session {session:02d}", flush=True)
+            if session_filepath.exists():
+                print(f"Saved session {session:02d}", flush=True)
     
     def load_roi_cache(self, roi_base_path: Path, roi: Path):
         """
