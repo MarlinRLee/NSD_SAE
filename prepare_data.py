@@ -72,19 +72,19 @@ def _loadmat(filename):
     return _check_keys(data)
 
 
-def download(nsd_bucket: str, path: str, aws_args: str) -> None:
+def download(nsd_bucket: str, path: str, aws_args: str, subjects = [1]) -> None:
     path = Path(path)
-    download_nsd_timeseries_dataset(nsd_bucket, path, aws_args)
+    download_nsd_timeseries_dataset(nsd_bucket, path, aws_args, subjects = subjects)
     prepare_dataset(path)
 
 
-def download_nsd_timeseries_dataset(nsd_bucket: str, path: Path, aws_args: str) -> None:
+def download_nsd_timeseries_dataset(nsd_bucket: str, path: Path, aws_args: str, subjects = [1]) -> None:
     path.mkdir(exist_ok=True, parents=True)
 
     aws_cmds = []
     
     nsd_bucket = nsd_bucket.rstrip('/')
-    for subject in [1, 2, 5, 7]:
+    for subject in subjects:
         # timeseries data
         for data_type in ["timeseries", "design"]:
             aws_cmd = (
@@ -138,28 +138,10 @@ def extract_test_images_ids(path: Path) -> None:
 
 
 if __name__ == "__main__":
-    argparser = argparse.ArgumentParser()
-    argparser.add_argument(
-        "--nsd_bucket",
-        type=str,
-        required=True,
-        help="NSD S3 bucket URI, in the form 's3://...' (requires agreement to NSD Terms & Conditions)",
-    )
 
-    argparser.add_argument(
-        "--path",
-        type=str,
-        required=True,
-        help="Path where the NSD data will be downloaded and prepared",
-    )
-
-    argparser.add_argument(
-        "--aws_args",
-        type=str,
-        default="",
-        help="Additional AWS args to use for downloading NSD data",
-    )
-
-    args = argparser.parse_args()
-    download(args.nsd_bucket, args.path, args.aws_args)
+    nsd_bucket = ""#required to replace with real nsd bucket
+    path = "nsddata"#required to replace with saved location. default is nsddata
+    aws_args = ""
+    subjects = [1]#,2,5,7
+    download(nsd_bucket, path, aws_args, subjects)
     print("Done downloading and preparing NSD data.")
