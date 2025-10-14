@@ -17,6 +17,8 @@ from torch.utils.data import DataLoader
 import h5py
 from PIL import Image
 import gc
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import mmap
 import struct
 
@@ -158,6 +160,21 @@ class NSDDataset(torch.utils.data.Dataset):
     def __del__(self):
         self.close()
 
+
+def _process_single_file(session_filepath: Path, roi_mask_flat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Loads one HDF5 file, applies the ROI mask, and returns the results.
+    This is the target function for each worker process.
+    """
+    print(f"  Worker {os.getpid()} processing {session_filepath.name}...", flush=True)
+    with h5py.File(session_filepath, 'r') as src:
+        fmri_full_session = src['fmri'][:]
+        metadata_full_session = src['metadata'][:]
+        
+        # Apply ROI mask in memory
+        roi_fmri = fmri_full_session[:, roi_mask_flat]
+        
+        return roi_fmri, metadata_full_session
 
 class NsdSaeDataConfig(pydantic.BaseModel):
 
@@ -383,72 +400,63 @@ class NsdSaeDataConfig(pydantic.BaseModel):
                 print(f"Saved session {session:02d}", flush=True)
     
     def load_roi_cache(self, roi_base_path: Path, roi: Path):
-        """
-        Builds ROI cache as .npy files for fMRI and metadata.
-        The roi_base_path is the .h5 path, which we use to derive 
-        the .fmri.npy and .meta.npy paths.
-        """
-        fmri_cache_path = roi_base_path.with_suffix(".fmri.npy")
-        meta_cache_path = roi_base_path.with_suffix(".meta.npy")
+            """
+            Builds ROI cache using a pool of processes for maximum speed.
+            """
+            fmri_cache_path = roi_base_path.with_suffix(".fmri.npy")
+            meta_cache_path = roi_base_path.with_suffix(".meta.npy")
 
-        if fmri_cache_path.exists() and meta_cache_path.exists():
-            print(f"Found cached ROI data: {fmri_cache_path}", flush=True)
-            return  # Both files exist, we're done
+            if fmri_cache_path.exists() and meta_cache_path.exists():
+                print(f"Found cached ROI data: {fmri_cache_path}", flush=True)
+                return
 
-        print(f"Building ROI cache at {fmri_cache_path} and {meta_cache_path}", flush=True)
-        preproc_dir = self._get_preproc_dir_path()
-        self.preprocess_full_brain(preproc_dir)
-        
-        roi_path = Path(roi)
-        roi_mask = nibabel.load(roi_path, mmap=True).get_fdata() > 0
-        roi_mask_flat = roi_mask.flatten()
-        n_roi_voxels = roi_mask_flat.sum()
-        
-        print(f"ROI has {n_roi_voxels} voxels", flush=True)
-        
-        session_files = sorted(preproc_dir.glob("session_*.h5"))
-        print(f"Processing {len(session_files)} sessions...", flush=True)
-        
-        fmri_chunks = []
-        meta_chunks = []
-        
-        for session_filepath in session_files:
-            print(f"  Processing {session_filepath.name}", flush=True)
+            print(f"Building ROI cache at {fmri_cache_path} and {meta_cache_path}", flush=True)
+            preproc_dir = self._get_preproc_dir_path()
+            self.preprocess_full_brain(preproc_dir)
             
-            with h5py.File(session_filepath, 'r') as src:
-                n_samples = src['fmri'].shape[0]
-
-                for start_idx in range(0, n_samples, self.chunk_size):
-                    end_idx = min(start_idx + self.chunk_size, n_samples)
-                    
-                    fmri_chunk = src['fmri'][start_idx:end_idx]
-                    metadata_chunk = src['metadata'][start_idx:end_idx]
-                    
-                    # Apply ROI mask
-                    roi_fmri = fmri_chunk[:, roi_mask_flat]
-                    
-                    fmri_chunks.append(roi_fmri)
-                    meta_chunks.append(metadata_chunk)
-                    
-                    del fmri_chunk, metadata_chunk, roi_fmri
-                    # Don't need gc.collect() here, chunks are small
+            roi_path = Path(roi)
+            roi_mask = nibabel.load(roi_path, mmap=True).get_fdata() > 0
+            roi_mask_flat = roi_mask.flatten()
+            n_roi_voxels = roi_mask_flat.sum()
             
-            gc.collect() # Collect after each session file
+            print(f"ROI has {n_roi_voxels} voxels", flush=True)
+            
+            session_files = sorted(preproc_dir.glob("session_*.h5"))
+            
+            # Determine number of workers, e.g., number of CPUs available
+            num_workers = min(len(session_files), os.cpu_count() or 1)
+            print(f"Processing {len(session_files)} sessions in parallel with {num_workers} workers...", flush=True)
+            
+            # Use a ProcessPoolExecutor to parallelize the work
+            fmri_chunks = []
+            meta_chunks = []
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all file processing tasks to the pool
+                future_to_file = {executor.submit(_process_single_file, fp, roi_mask_flat): fp for fp in session_files}
+                
+                for future in as_completed(future_to_file):
+                    try:
+                        # Retrieve the result (masked_fmri, metadata)
+                        roi_fmri, metadata = future.result()
+                        fmri_chunks.append(roi_fmri)
+                        meta_chunks.append(metadata)
+                    except Exception as exc:
+                        print(f'{future_to_file[future]} generated an exception: {exc}')
 
-        print("Concatenating data...")
-        final_fmri = np.concatenate(fmri_chunks, axis=0).astype(np.float16)
-        final_meta = np.concatenate(meta_chunks, axis=0)
-        
-        print(f"Saving fMRI data ({final_fmri.shape}) to {fmri_cache_path}")
-        np.save(fmri_cache_path, final_fmri)
-        
-        print(f"Saving metadata ({final_meta.shape}) to {meta_cache_path}")
-        np.save(meta_cache_path, final_meta)
+            print("Concatenating data from all workers...")
+            final_fmri = np.concatenate(fmri_chunks, axis=0).astype(np.float16)
+            final_meta = np.concatenate(meta_chunks, axis=0)
+            
+            print(f"Saving fMRI data ({final_fmri.shape}) to {fmri_cache_path}")
+            np.save(fmri_cache_path, final_fmri)
+            
+            print(f"Saving metadata ({final_meta.shape}) to {meta_cache_path}")
+            np.save(meta_cache_path, final_meta)
 
-        del fmri_chunks, meta_chunks, final_fmri, final_meta
-        gc.collect()
+            del fmri_chunks, meta_chunks, final_fmri, final_meta
+            gc.collect()
 
-        print(f"ROI cache created: {fmri_cache_path.parent}", flush=True)
+            print(f"ROI cache created: {fmri_cache_path.parent}", flush=True)
     
     def load_roi_NSDDataset(self, roi: str = "", return_fmri_only: bool = True) -> NSDDataset:
         img_path = Path(self.nsddata_path).resolve() / "nsd_stimuli.hdf5"
