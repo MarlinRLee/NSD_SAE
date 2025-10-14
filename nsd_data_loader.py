@@ -39,11 +39,12 @@ class NSDDataset(torch.utils.data.Dataset):
         self.metadata = np.load(meta_cache_path, allow_pickle=True)
         
         self._length = self.fmri_data.shape[0]
+        self.voxel_dim = self.fmri_data.shape[1]
         
         print(f"Dataset initialized with {self._length} samples", flush=True)
         print(f"Voxel count per sample: {self.fmri_data.shape[1]}", flush=True)
     
-    def change_return_type(return_fmri_only: bool):
+    def change_return_type(self, return_fmri_only: bool):
         self.return_fmri_only = return_fmri_only
 
     def __len__(self) -> int:
@@ -51,7 +52,7 @@ class NSDDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, idx: int) -> tp.Union[torch.Tensor, dict[str, torch.Tensor]]:
         # Reading from a memory-map is extremely fast and process-safe
-        fmri_tensor = torch.from_numpy(self.fmri_data[idx].astype(np.float32))
+        fmri_tensor = torch.from_numpy(self.fmri_data[idx])
         
         if self.return_fmri_only:
             return fmri_tensor
@@ -161,12 +162,85 @@ class NSDDataset(torch.utils.data.Dataset):
         self.close()
 
 
+def _process_single_session(session_num: int, config: 'NsdSaeDataConfig', preproc_dir: Path):
+    """
+    Processes all runs for a single session and saves the result to an HDF5 file.
+    This is the target function for the first parallel step.
+    """
+    worker_pid = os.getpid()
+    
+    session_filepath = preproc_dir / f"session_{session_num:02d}.h5"
+    nsddata_path = Path(config.nsddata_path).resolve()
+    
+    # Logic to determine which runs belong to this session
+    subject_to_14run_sessions = {1: (21, 38), 5: (21, 38), 2: (21, 30), 7: (21, 30)}
+    runs_range = (
+        range(2, 14)
+        if config.subject_id in subject_to_14run_sessions and
+           subject_to_14run_sessions[config.subject_id][0] <= session_num <= subject_to_14run_sessions[config.subject_id][1]
+        else range(1, 13)
+    )
+
+    first_run = True
+    for run in runs_range:
+        run_id = f"session{session_num:02d}_run{run:02d}"
+        
+        # Load stimulus info
+        path_to_df = nsddata_path / f"nsddata_timeseries/ppdata/subj{config.subject_id:02d}/func1pt8mm/design/design_{run_id}.tsv"
+        im_ids = pd.read_csv(path_to_df, header=None).iloc[:, 0]
+        
+        # Load and process fMRI data
+        nifti_fp = nsddata_path / f"nsddata_timeseries/ppdata/subj{config.subject_id:02d}/func1pt8mm/timeseries/timeseries_{run_id}.nii.gz"
+        nifti = nibabel.load(nifti_fp, mmap=True)
+        
+        nifti_data_T = nifti.get_fdata(dtype=np.float16)[..., :NUM_TRS_PER_RUN].T
+        shape = nifti_data_T.shape
+        n_voxels = np.prod(shape[1:])
+        
+        if first_run:
+            estimated_samples = len(list(runs_range)) * NUM_TRS_PER_RUN
+            config._create_session_hdf5(session_filepath, n_voxels, estimated_samples)
+            first_run = False
+        
+        cleaned_data = nilearn.signal.clean(nifti_data_T.reshape(shape[0], -1), detrend=True, high_pass=None, t_r=TR_s, standardize="zscore_sample")
+        run_fmri_data = cleaned_data.reshape(shape).T.astype(np.float16)
+        del nifti_data_T, cleaned_data
+        nifti.uncache()
+        
+        fmri_batch, metadata_batch = [], []
+        stimulus_history_queue = deque([-1] * config.history_length, maxlen=config.history_length)
+        last_event_id = 0
+        offset_in_TRs = int(round(config.offset / TR_s))
+
+        for t in range(run_fmri_data.shape[-1]):
+            stim_t = t - offset_in_TRs
+            if 0 <= stim_t < len(im_ids):
+                current_event_id = im_ids.iloc[stim_t]
+                if current_event_id > 0 and current_event_id != last_event_id:
+                    stimulus_history_queue.append(current_event_id - 1)
+                    last_event_id = current_event_id
+            
+            fmri_batch.append(run_fmri_data[..., t].flatten())
+            metadata_batch.append((list(stimulus_history_queue), config.subject_id, session_num, run, float(t)))
+            
+            if len(fmri_batch) >= config.chunk_size:
+                config._append_to_hdf5(session_filepath, np.array(fmri_batch, dtype=np.float16), metadata_batch)
+                fmri_batch, metadata_batch = [], []
+        
+        if fmri_batch:
+            config._append_to_hdf5(session_filepath, np.array(fmri_batch, dtype=np.float16), metadata_batch)
+        
+        del run_fmri_data
+        gc.collect()
+
+    print(f"  Finished session {session_num:02d}. Saved to {session_filepath.name}", flush=True)
+    return session_filepath
+
 def _process_single_file(session_filepath: Path, roi_mask_flat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Loads one HDF5 file, applies the ROI mask, and returns the results.
     This is the target function for each worker process.
     """
-    print(f"  Worker {os.getpid()} processing {session_filepath.name}...", flush=True)
     with h5py.File(session_filepath, 'r') as src:
         fmri_full_session = src['fmri'][:]
         metadata_full_session = src['metadata'][:]
@@ -254,150 +328,37 @@ class NsdSaeDataConfig(pydantic.BaseModel):
     
     def preprocess_full_brain(self, preproc_dir: Path):
         """
-        Process fMRI data and save to HDF5 files
+        Processes all sessions in parallel, skipping sessions that already exist.
         """
         preproc_dir.mkdir(exist_ok=True, parents=True)
-        
-        # 1. Identify all expected session files
-        expected_session_files = {preproc_dir / f"session_{session:02d}.h5" for session in range(1, 41)}
-        
-        # 2. Check the existence of each file
-        existing_session_files = {f for f in expected_session_files if f.exists()}
-        
-        num_existing = len(existing_session_files)
-        num_expected = len(expected_session_files)
 
-        # 3. Determine the state of the cache
-        if num_existing == num_expected:
-            print(f"Found all {num_expected} preprocessed session files at {preproc_dir}. Skipping creation.", flush=True)
+        # 1. Identify which session files are missing.
+        sessions_to_process = []
+        for session_num in range(1, 41):
+            if not (preproc_dir / f"session_{session_num:02d}.h5").exists():
+                sessions_to_process.append(session_num)
+
+        # 2. If all files exist, we're done.
+        if not sessions_to_process:
+            print(f"Brain data already preprocessed at: {preproc_dir}", flush=True)
             return
-
-        elif 0 < num_existing < num_expected:
-            # 4. Case: Subset missing, print warning
-            missing_files = expected_session_files - existing_session_files
-            print("WARNING: Full-brain cache is partially built.", flush=True)
-            print(f"Missing {len(missing_files)} of {num_expected} session files (e.g., {next(iter(missing_files)).name}). Rebuilding or completing the cache.", flush=True)
-            
-        elif num_existing == 0:
-            print(f"No existing preprocessed full-brain data found at {preproc_dir}. Starting creation.", flush=True)
-
-        # Proceed with creation/completion of the cache
-        print(f"Processing full-brain data into {preproc_dir}...", flush=True)
         
-        nsddata_path = Path(self.nsddata_path).resolve()
-        subject_to_14run_sessions = {1: (21, 38), 5: (21, 38), 2: (21, 30), 7: (21, 30)}
-        offset_in_TRs = int(round(self.offset / TR_s))
-        
-        for session in range(1, 41):
-            session_filepath = preproc_dir / f"session_{session:02d}.h5"
-            
-            # Skip session if the file already exists (handles partial build completion)
-            if session_filepath.exists():
-                continue
-                
-            print(f"\nProcessing session {session:02d}", flush=True)
-            
-            runs_range = (
-                range(2, 14)
-                if self.subject_id in subject_to_14run_sessions and 
-                   subject_to_14run_sessions[self.subject_id][0] <= session <= subject_to_14run_sessions[self.subject_id][1]
-                else range(1, 13)
-            )
-            
-            first_run = True
-            
-            for run in runs_range:
-                run_id = f"session{session:02d}_run{run:02d}"
-                print(f"     Processing: {run_id}", flush=True)
-                
-                # Load stimulus info
-                path_to_df = nsddata_path / f"nsddata_timeseries/ppdata/subj{self.subject_id:02d}/func1pt8mm/design/design_{run_id}.tsv"
-                try:
-                    im_ids = pd.read_csv(path_to_df, header=None).iloc[:, 0]
-                except FileNotFoundError:
-                    print(f"Design file not found for {run_id}. Skipping run.", flush=True)
-                    continue
-                
-                # Load and process fMRI data
-                nifti_fp = nsddata_path / f"nsddata_timeseries/ppdata/subj{self.subject_id:02d}/func1pt8mm/timeseries/timeseries_{run_id}.nii.gz"
-                try:
-                    nifti = nibabel.load(nifti_fp, mmap=True)
-                except FileNotFoundError:
-                    print(f"Nifti file not found for {run_id}. Skipping run.", flush=True)
-                    continue
+        print(f"Found {40 - len(sessions_to_process)} existing session files. Processing the {len(sessions_to_process)} missing sessions...", flush=True)
 
-                nifti_data_T = nifti.get_fdata(dtype=np.float16)[..., :NUM_TRS_PER_RUN].T
-                shape = nifti_data_T.shape
-                n_voxels = np.prod(shape[1:])
-                
-                # Initialize HDF5 file on first run *of this session*
-                if first_run:
-                    estimated_samples = len(runs_range) * NUM_TRS_PER_RUN
-                    self._create_session_hdf5(session_filepath, n_voxels, estimated_samples)
-                    first_run = False
-                
-                # Clean signal
-                cleaned_data = nilearn.signal.clean(
-                    nifti_data_T.reshape(shape[0], -1),
-                    detrend=True,
-                    high_pass=None,
-                    t_r=TR_s,
-                    standardize="zscore_sample"
-                )
-                
-                run_fmri_data = cleaned_data.reshape(shape).T.astype(np.float16)
-                del nifti_data_T, cleaned_data
-                
-                nifti.uncache()
-                
-                # Process in chunks to reduce memory
-                fmri_batch = []
-                metadata_batch = []
-                
-                stimulus_history_queue = deque([-1] * self.history_length, maxlen=self.history_length)
-                last_event_id = 0
-                
-                for t in range(run_fmri_data.shape[-1]):
-                    stim_t = t - offset_in_TRs
-                    if 0 <= stim_t < len(im_ids):
-                        current_event_id = im_ids.iloc[stim_t]
-                        if current_event_id > 0 and current_event_id != last_event_id:
-                            stimulus_history_queue.append(current_event_id - 1)
-                            last_event_id = current_event_id
-                    
-                    fmri_batch.append(run_fmri_data[..., t].flatten())
-                    metadata_batch.append((
-                        list(stimulus_history_queue),
-                        self.subject_id,
-                        session,
-                        run,
-                        float(t)
-                    ))
-                    
-                    # Write in chunks
-                    if len(fmri_batch) >= self.chunk_size:
-                        self._append_to_hdf5(
-                            session_filepath,
-                            np.array(fmri_batch, dtype=np.float16),
-                            metadata_batch
-                        )
-                        fmri_batch = []
-                        metadata_batch = []
-                        gc.collect()
-                
-                # Write remaining data
-                if fmri_batch:
-                    self._append_to_hdf5(
-                        session_filepath,
-                        np.array(fmri_batch, dtype=np.float16),
-                        metadata_batch
-                    )
-                
-                del run_fmri_data
-                gc.collect()
+        num_workers = min(len(sessions_to_process)//4, os.cpu_count() or 1)
+        print(f"Beginning parallel preprocessing with {num_workers} workers...", flush=True)
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # 3. Submit only the missing sessions to the pool.
+            futures = [executor.submit(_process_single_session, session, self, preproc_dir) for session in sessions_to_process]
             
-            if session_filepath.exists():
-                print(f"Saved session {session:02d}", flush=True)
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"A session processing task generated an exception: {exc}")
+        
+        print("All missing sessions have been preprocessed successfully.", flush=True)
     
     def load_roi_cache(self, roi_base_path: Path, roi: Path):
             """
@@ -424,7 +385,7 @@ class NsdSaeDataConfig(pydantic.BaseModel):
             session_files = sorted(preproc_dir.glob("session_*.h5"))
             
             # Determine number of workers, e.g., number of CPUs available
-            num_workers = min(len(session_files), os.cpu_count() or 1)
+            num_workers = min(len(session_files)//4, os.cpu_count() or 1)
             print(f"Processing {len(session_files)} sessions in parallel with {num_workers} workers...", flush=True)
             
             # Use a ProcessPoolExecutor to parallelize the work
@@ -444,7 +405,7 @@ class NsdSaeDataConfig(pydantic.BaseModel):
                         print(f'{future_to_file[future]} generated an exception: {exc}')
 
             print("Concatenating data from all workers...")
-            final_fmri = np.concatenate(fmri_chunks, axis=0).astype(np.float16)
+            final_fmri = np.concatenate(fmri_chunks, axis=0).astype(np.float32)
             final_meta = np.concatenate(meta_chunks, axis=0)
             
             print(f"Saving fMRI data ({final_fmri.shape}) to {fmri_cache_path}")

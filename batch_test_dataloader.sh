@@ -1,8 +1,8 @@
 #!/bin/bash -l
-#SBATCH --time=10:00
+#SBATCH --time=01:00:00
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=30g
+#SBATCH --mem=60g
 #SBATCH --tmp=20g
 #SBATCH --gres=gpu:a100:1
 #SBATCH -p a100-4
@@ -45,14 +45,14 @@ echo "=================================="
 # Optimized test with GPU and tuned parameters
 python test_dataloader.py \
   --nsddata_path nsddata \
-  --roi_path nsddata/nsddata/ppdata/subj01/func1pt8mm/roi/nsdgeneral.nii.gz \
+  --roi_path nsddata/nsddata/ppdata/subj01/func1pt8mm/roi/streams.nii.gz \
   --subject_id 1 \
   --batch_size 512 \
   --workers 8 \
   --chunk_size 2000 \
-  --hdf5_chunk_rows 256 \
+  --hdf5_chunk_rows 1024 \
   --epochs 10 \
-  --warmup 5\
+  --warmup 5 \
   --profile
 
 echo "=================================="

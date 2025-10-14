@@ -113,16 +113,16 @@ The data loader uses a two-stage caching system to avoid reprocessing data.
   * **Trigger:** Runs automatically if the preprocessed cache directory (`.cache/subj{ID}_preprocessed/`) is not found.
   * **Process:** Iterates through every NIfTI file for the subject, applies detrending and z-score standardization, and saves the cleaned, full-brain data for each session into its own `.pt` file.
   * **Cost:** This is a one-time process per subject.
-      * **Time:** \~3 hours
-      * **Disk Space:** \~250 GB
-      * **Peak RAM:** \~10 GB
+      * **Time:** \25 min
+      * **Disk Space:** \80GB
+      * **Peak RAM:** \~50 GB (4.14 GB per worker)
 
 **Stage 2: ROI Cache Generation**
 
   * **Trigger:** Runs if the preprocessed data exists, but a cache for the **specific requested ROI** does not.
   * **Process:** Loads the preprocessed full-brain data session-by-session, applies the ROI mask to extract only the relevant voxels, and saves all samples into a **single, final cache file**.
   * **Cost:** This is a one-time process per ROI.
-      * **Time:** \~15 minutes (for the large `general` ROI)
+      * **Time:** \~3 minutes (for the large `general` ROI)
       * **Peak RAM:** \~25 GB
 
 Once an ROI-specific cache is built, any future experiment using that same ROI will load almost instantly. ✅
