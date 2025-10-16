@@ -4,23 +4,21 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this tree.
 
-from collections import deque
-import typing as tp
+import torch
 from pathlib import Path
+import numpy as np
+import typing as tp
+import shutil
 import nibabel
 import nilearn.signal
-import numpy as np
 import pandas as pd
 import pydantic
-import torch
 from torch.utils.data import DataLoader
 import h5py
 from PIL import Image
 import gc
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import mmap
-import struct
 
 TR_s = 4 / 3
 NUM_TRS_PER_RUN = 225
@@ -419,19 +417,41 @@ class NsdSaeDataConfig(pydantic.BaseModel):
 
             print(f"ROI cache created: {fmri_cache_path.parent}", flush=True)
     
-    def load_roi_NSDDataset(self, roi: str = "", return_fmri_only: bool = True) -> NSDDataset:
+    def load_roi_NSDDataset(self, roi: str = "", return_fmri_only: bool = True, local_file = "") -> NSDDataset:
         img_path = Path(self.nsddata_path).resolve() / "nsd_stimuli.hdf5"
         
-        # Get the base path (e.g., .../cache.h5)
+        # Get the base pat
         roi_base_cache_path = self._get_roi_cache_filepath(roi)
         
         # This will create/load the .npy cache files
-        self.generate_roi_cache(roi_base_cache_path, roi)
+        self.generate_roi_cache(roi_base_cache_path, Path(roi))
         
         # Derive the new .npy paths
         fmri_cache_path = roi_base_cache_path.with_suffix(".fmri.npy")
         meta_cache_path = roi_base_cache_path.with_suffix(".meta.npy")
         
+
+        if local_file != "":#/content/cache is what you want for colab
+            print(f"Copying files to local disk ({local_file}).", flush=True)
+            
+            # Define Local Paths
+            LOCAL_DIR = Path(local_file)
+            LOCAL_DIR.mkdir(exist_ok=True)
+            
+            fmri_cache_path_local = LOCAL_DIR / fmri_cache_path.name
+            meta_cache_path_local = LOCAL_DIR / meta_cache_path.name
+
+
+            if not fmri_cache_path_local.exists():
+                shutil.copy(fmri_cache_path, fmri_cache_path_local)
+
+            if not meta_cache_path_local.exists():
+                shutil.copy(meta_cache_path, meta_cache_path_local)
+        
+            # Update the paths to the local copies for the Dataset initializer
+            fmri_cache_path = fmri_cache_path_local
+            meta_cache_path = meta_cache_path_local
+
         # Dataset uses memory-mapping internally
         return NSDDataset(
             fmri_cache_path=fmri_cache_path,
