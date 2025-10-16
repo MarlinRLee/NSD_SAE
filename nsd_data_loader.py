@@ -360,7 +360,7 @@ class NsdSaeDataConfig(pydantic.BaseModel):
         
         print("All missing sessions have been preprocessed successfully.", flush=True)
     
-    def load_roi_cache(self, roi_base_path: Path, roi: Path):
+    def generate_roi_cache(self, roi_base_path: Path, roi: Path):
             """
             Builds ROI cache using a pool of processes for maximum speed.
             """
@@ -426,7 +426,7 @@ class NsdSaeDataConfig(pydantic.BaseModel):
         roi_base_cache_path = self._get_roi_cache_filepath(roi)
         
         # This will create/load the .npy cache files
-        self.load_roi_cache(roi_base_cache_path, roi)
+        self.generate_roi_cache(roi_base_cache_path, roi)
         
         # Derive the new .npy paths
         fmri_cache_path = roi_base_cache_path.with_suffix(".fmri.npy")
