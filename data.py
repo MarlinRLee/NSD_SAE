@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 import h5py
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
 class NSDDataset(torch.utils.data.Dataset):
@@ -82,13 +82,41 @@ class NSDDataset(torch.utils.data.Dataset):
     def __get_image__(self, idx: int) -> Image.Image:
         """
         Special method to retrieve a PIL image from the main NSD HDF5 file.
+
+        If the index is -1, it returns a gray image with text indicating no image was seen.
         
         NOTE: 'idx' here is the **image ID (stimulus_history value)**, not the sample index.
         """
-        with h5py.File(self.stimuli_path, 'r') as stim_file:
-            img_brick = stim_file['imgBrick']
-            image_data = img_brick[idx]
-        return Image.fromarray(image_data)
+        if idx != -1:
+            with h5py.File(self.stimuli_path, 'r') as stim_file:
+                img_brick = stim_file['imgBrick']
+                image_data = img_brick[idx]
+            return Image.fromarray(image_data)
+        
+        # --- Create a placeholder image for "no seen image" ---
+        width, height = 425, 425
+        bg_color = (128, 128, 128)  # Gray
+        text = "no seen image"
+        
+        # Create a new gray image
+        img = Image.new('RGB', (width, height), color=bg_color)
+        draw = ImageDraw.Draw(img)
+        
+        # Load a font (using default as a fallback)
+        try:
+            font = ImageFont.truetype("arial.ttf", size=30)
+        except IOError:
+            font = ImageFont.load_default()
+            
+        # Calculate text position to center it
+        _, _, text_width, text_height = draw.textbbox((0, 0), text, font=font)
+        text_x = (width - text_width) / 2
+        text_y = (height - text_height) / 2
+        
+        # Draw the text on the image
+        draw.text((text_x, text_y), text, font=font, fill=(255, 255, 255)) # White text
+        
+        return img
 
     def get_sequence_item(self, idx: int) -> tp.Optional[dict[str, torch.Tensor]]:  
         """
