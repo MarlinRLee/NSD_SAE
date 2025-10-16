@@ -45,15 +45,16 @@ config = NsdSaeDataConfig(
 )
 
 # 2. Define ROI
-# Use a NIfTI path. Example: full-brain general mask
+# Use a NIfTI path. Example: the general NSD mask
 roi_path = "/path/to/nsddata/nsddata/ppdata/subj01/func1pt8mm/roi/general.nii.gz"
 
 # 3. Build the dataset
 # This function automatically triggers cache creation if necessary.
 dataset = config.load_roi_NSDDataset(
     roi=roi_path, 
-    return_fmri_only=True, # Can be changed after loading but better during training
-    num_workers=8 
+    return_fmri_only=True, # Can be changed after loading but better to only return the fmri's during training
+    num_workers=8 ,
+    
 )
 
 # 4. Create DataLoader
@@ -103,23 +104,20 @@ To retrieve fMRI data *with* its corresponding metadata (e.g., session, run, tim
 
 -----
 
-## 🧠 Caching Workflow in Detail
+## Caching Workflow in Detail
 
-The pipeline is designed to be run once per subject and once per unique ROI, leveraging multiprocessing to minimize wait times.
+The pipeline is designed to be run once per subject and once per unique ROI.
 
 ### 1\. Stage 1: Full-Brain Preprocessing (Intermediate HDF5 Cache)
 
-| Step | Purpose | Output | Cost (Subj 01) |
+| Step | Purpose | Output | Cost (Subj 01, 1 worker) |
 | :--- | :--- | :--- | :--- |
-| **`preprocess_full_brain()`** | Cleans raw NIfTI data: applies **detrending, standardization (z-score)**, and **HRF time-shift**. | Per-session **`.h5` files** containing full-brain fMRI data and metadata. | $\sim 25$ min, $\sim 80$ GB disk |
-| **Notes** | This is a **one-time process per subject**. We use HDF5 for high-performance chunked I/O. | | |
+| **`preprocess_full_brain()`** | Cleans raw NIfTI data: applies **detrending, standardization (z-score)**, and **HRF time-shift**. | Per-session **`.h5` files** containing full-brain fMRI data and metadata. | $\sim 2$ hours, $\sim 5$ GB |
+
 
 ### 2\. Stage 2: ROI Cache Generation (Final Memory-Mapped Cache)
 
-| Step | Purpose | Output | Cost (Subj 01, General ROI) |
+| Step | Purpose | Output | Cost (Subj 01, General ROI, 1 worker)
 | :--- | :--- | :--- | :--- |
-| **`load_roi_cache()`** | Loads Stage 1 data, applies the **ROI mask**, and concatenates all sessions into final arrays. | Final **`.fmri.npy`** and **`.meta.npy`** files, saved for memory-mapping. | $\sim 3$ min, $\sim 20$ GB disk |
+| **`load_roi_cache()`** | Loads Stage 1 data, applies the **ROI mask**, and concatenates all sessions into final arrays. | Final **`.fmri.npy`** and **`.meta.npy`** files, saved for memory-mapping. | $\sim 30$ min, $\sim 5$ GB |
 | **Notes** | This is a **one-time process per unique ROI**. Future loads of this ROI are **instantaneous** via `numpy.mmap_mode='r'`. | | |
-
-```
-```
