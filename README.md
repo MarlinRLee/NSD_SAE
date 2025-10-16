@@ -1,152 +1,125 @@
-# NSD Data Loader for PyTorch
+# NSD PyTorch Data Loader (SAE & Decoding Ready)
 
-This repository provides a flexible and efficient dataloader for the Natural Scenes Dataset (NSD), designed for PyTorch-based machine learning. It features a robust two-stage caching system to dramatically speed up data loading after the initial setup.
+This repository provides an optimized, parallelized PyTorch `DataLoader` pipeline for the **Natural Scenes Dataset (NSD)**. It is specifically designed to support the **Sparse Autoencoder (SAE)** project by providing fast access to individual fMRI time-steps, while retaining the capability to retrieve the corisponding **6-TR fMRI sequences** for runing it on dynadiff.
 
-The dataloader supports two primary modes:
-
-1.  **Time-step Mode**: Ideal for training models like Sparse Autoencoders (SAEs), where each sample is an individual fMRI time-step.
-2.  **Sequence Mode**: Designed for brain decoding tasks, allowing you to retrieve the full 6-TR fMRI response sequence corresponding to a single stimulus image.
+The pipeline features a robust, two-stage, multiprocessing-enabled caching system using `h5py` for intermediate storage and memory-mapped NumPy arrays (`mmap`) for the final dataset, ensuring highly efficient and process-safe data access.
 
 -----
 
-## How to Use
+## Quick Start & Usage
 
-### 1\. Prerequisites and Data Download
+### 1\. Setup
 
-First, clone the repository and download the necessary NSD data.
+Clone the repository and install dependencies:
 
-1.  **Install dependencies:**
+```bash
+pip install -r requirements.txt
+```
+
+### 2\. Data Download
+
+Use the provided `download.py` script to fetch the necessary NSD files.
+
+1.  **Configure `download.py`**: Update the S3 bucket URL, local `path`, and the list of `subjects` you require.
+
+2.  **Run**:
+
     ```bash
-    pip install torch pydantic pandas numpy nibabel nilearn h5py Pillow
+    python download.py
     ```
-2.  **Download NSD data:**
-    You will need to download the preprocessed fMRI time-series data (`nsddata_timeseries`), the stimulus images (`nsd_stimuli.hdf5`), and the ROI masks from the [official NSD data repository](https://naturalscenesdataset.org/). Organize them into a main `nsddata` directory.
 
-### 2\. Running Your Analysis
+### 3\. Core Workflow: `NsdSaeDataConfig`
 
-You will primarily interact with the `NsdSaeDataConfig` class to configure and build your dataset. The caching process is handled automatically.
-
-#### Example 1: Loading Individual fMRI Time-steps (for SAEs)
-
-This is the default behavior, optimized for speed by returning only fMRI data.
+The entire pipeline is managed by the **`NsdSaeDataConfig`** class, which handles all preprocessing, parallelization, and cache management.
 
 ```python
 from nsd_data_loader import NsdSaeDataConfig
 from torch.utils.data import DataLoader
 
-# 1. Configure the data handler
+# 1. Configuration
 config = NsdSaeDataConfig(
-    nsddata_path="/path/to/your/nsddata/", # Directory where you downloaded the data
+    nsddata_path="/path/to/nsddata/", # Root directory of your NSD download
     subject_id=1,
+    offset=4.6,     # HRF delay offset in seconds. This is what Dynadiff uses and seems standard so we should not mess with this without good reason.
+    history_length=4, # Past stimuli seen.
 )
 
-# 2. Define the path to your desired ROI
-# This can be a specific ROI like 'V1' or the whole brain 'general' mask
-roi_path = "nsddata/ppdata/subj01/func1pt8mm/roi/general.nii.gz"
+# 2. Define ROI
+# Use a NIfTI path. Example: full-brain general mask
+roi_path = "/path/to/nsddata/nsddata/ppdata/subj01/func1pt8mm/roi/general.nii.gz"
 
-# 3. Build the dataset. This triggers caching on the first run.
-# By default, `return_fmri_only=True` for maximum efficiency.
-print("Building dataset for SAE training...")
-dataset = config.build(roi=roi_path, return_fmri_only=True)
-print(f"Dataset ready with {len(dataset)} samples.")
+# 3. Build the dataset
+# This function automatically triggers cache creation if necessary.
+dataset = config.load_roi_NSDDataset(
+    roi=roi_path, 
+    return_fmri_only=True, # Can be changed after loading but better during training
+    num_workers=8 
+)
 
-# 4. Create a standard PyTorch DataLoader
+# 4. Create DataLoader
 train_loader = DataLoader(
     dataset,
     batch_size=4096,
     num_workers=8,
     shuffle=True
 )
-
-# 5. Use the dataloader in your training loop
-# The batch is a single tensor of fMRI data.
-first_batch = next(iter(train_loader))
-
-print("Batch type:", type(first_batch))
-print("fMRI data batch shape:", first_batch.shape) # Shape: [batch_size, num_voxels_in_roi]
 ```
 
-#### Example 2: Retrieving Full fMRI Sequences and Images (for Decoding)
+-----
 
-The `NSDDataset` object includes, `get_sequence_item(idx)`, which allows you to retrieve the 6-TR brain response dynadiff was trained to predict and the corresponding stimulus image for any time-step within that response window.
+## Feature Set
+
+### Mode 1: SAE Training (Time-step Mode)
+
+This is the default and most efficient mode, optimized for training SAEs voxel-wise on individual TRs.
+
+  * Set `return_fmri_only=True` in `load_roi_NSDDataset()`.
+  * **Output:** The `DataLoader` yields a single **`torch.Tensor`** of shape `[batch_size, num_voxels]`.
+
+### Mode 2: Decoding/Dynadiff (Sequence Mode)
+
+The underlying **`NSDDataset`** object supports retrieval of the full 6-TR sequence and the corresponding stimulus image for a stimulus presentation event.
+
+  * Use the **`.get_sequence_item(idx)`** method directly on the `dataset` object (not the `DataLoader`).
+
+<!-- end list -->
 
 ```python
-from nsd_data_loader import NsdSaeDataConfig
-import matplotlib.pyplot as plt
+# Assuming 'dataset' is loaded...
+sequence = dataset.get_sequence_item(5000)
 
-# Build the dataset as before
-config = NsdSaeDataConfig(nsddata_path="/path/to/your/nsddata/", subject_id=1)
-roi_path = "nsddata/ppdata/subj01/func1pt8mm/roi/general.nii.gz"
-dataset = config.build(roi=roi_path)
-
-# Use the .get_sequence_item() method on the dataset object
-# Let's get the sequence corresponding to the 5000th time-step in the data
-sequence_item = dataset.get_sequence_item(5000)
-
-
-# The method returns a dictionary with the brain scan sequence and the image
-fmri_sequence = sequence_item["brain"]
-stimulus_image = sequence_item["img"]
-subject_id = sequence_item["subject_idx"]
-
-print("--- Sequence Item ---")
-print(f"Subject Index: {subject_id.item()}")
-print(f"fMRI sequence shape: {fmri_sequence.shape}") # Shape: [6, num_voxels_in_roi]
-print(f"Stimulus image shape: {stimulus_image.shape}") # Shape: [3, 425, 425]
-
-# Display the stimulus image
-plt.imshow(stimulus_image.permute(1, 2, 0))
-plt.title("Stimulus Image")
-plt.axis('off')
-plt.show()
-
+if sequence:
+    fmri_sequence = sequence["brain"] # Shape: [6, num_voxels]
+    stimulus_image = sequence["img"] # Shape: [3, 425, 425]
+    
+    print(f"6-TR sequence retrieved: {fmri_sequence.shape}")
 ```
 
------
+### Metadata Retrieval
 
-## The Caching Workflow Explained 🧠
+To retrieve fMRI data *with* its corresponding metadata (e.g., session, run, time, stimulus history), set **`return_fmri_only=False`**.
 
-The data loader uses a two-stage caching system to avoid reprocessing data.
-
-**Stage 1: Initial Preprocessing (Full Brain)**
-
-  * **Trigger:** Runs automatically if the preprocessed cache directory (`.cache/subj{ID}_preprocessed/`) is not found.
-  * **Process:** Iterates through every NIfTI file for the subject, applies detrending and z-score standardization, and saves the cleaned, full-brain data for each session into its own `.pt` file.
-  * **Cost:** This is a one-time process per subject.
-      * **Time:** \25 min
-      * **Disk Space:** \80GB
-      * **Peak RAM:** \~50 GB (4.14 GB per worker)
-
-**Stage 2: ROI Cache Generation**
-
-  * **Trigger:** Runs if the preprocessed data exists, but a cache for the **specific requested ROI** does not.
-  * **Process:** Loads the preprocessed full-brain data session-by-session, applies the ROI mask to extract only the relevant voxels, and saves all samples into a **single, final cache file**.
-  * **Cost:** This is a one-time process per ROI.
-      * **Time:** \~3 minutes (for the large `general` ROI)
-      * **Peak RAM:** \~25 GB
-
-Once an ROI-specific cache is built, any future experiment using that same ROI will load almost instantly. ✅
+  * **Output:** The `DataLoader` yields a dictionary with keys: `fmri`, `stimulus_history`, `subject_idx`, `session`, `run`, and `time`.
 
 -----
 
-## Data Sample Format
+## 🧠 Caching Workflow in Detail
 
-The format of the data yielded by the `DataLoader` depends on the `return_fmri_only` flag set during the `config.build()` call.
+The pipeline is designed to be run once per subject and once per unique ROI, leveraging multiprocessing to minimize wait times.
 
-#### Default: `return_fmri_only=True`
+### 1\. Stage 1: Full-Brain Preprocessing (Intermediate HDF5 Cache)
 
-The `DataLoader` yields a single **torch.Tensor**.
+| Step | Purpose | Output | Cost (Subj 01) |
+| :--- | :--- | :--- | :--- |
+| **`preprocess_full_brain()`** | Cleans raw NIfTI data: applies **detrending, standardization (z-score)**, and **HRF time-shift**. | Per-session **`.h5` files** containing full-brain fMRI data and metadata. | $\sim 25$ min, $\sim 80$ GB disk |
+| **Notes** | This is a **one-time process per subject**. We use HDF5 for high-performance chunked I/O. | | |
 
-  * **Shape**: `(batch_size, num_voxels)`
-  * **Content**: The fMRI brain data for one time-step, filtered to the ROI and flattened.
+### 2\. Stage 2: ROI Cache Generation (Final Memory-Mapped Cache)
 
-#### Dictionary Mode: `return_fmri_only=False`
+| Step | Purpose | Output | Cost (Subj 01, General ROI) |
+| :--- | :--- | :--- | :--- |
+| **`load_roi_cache()`** | Loads Stage 1 data, applies the **ROI mask**, and concatenates all sessions into final arrays. | Final **`.fmri.npy`** and **`.meta.npy`** files, saved for memory-mapping. | $\sim 3$ min, $\sim 20$ GB disk |
+| **Notes** | This is a **one-time process per unique ROI**. Future loads of this ROI are **instantaneous** via `numpy.mmap_mode='r'`. | | |
 
-If you need metadata alongside the fMRI data, set the flag to `False`. The `DataLoader` will yield a dictionary with the following keys for each time-step:
-
-  * `fmri`: A `torch.Tensor` containing the fMRI data.
-  * `stimulus_history`: A `torch.Tensor` of shape `(history_length,)` with the indices of the last N images shown.
-  * `subject_idx`: The integer index of the subject (e.g., `1`).
-  * `session`: The session number.
-  * `run`: The run number within the session.
-  * `time`: The time-step index within the run.
+```
+```
