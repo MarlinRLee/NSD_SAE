@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this tree.
 
+from typing import Optional, Union
 import torch
 from collections import deque
 from pathlib import Path
@@ -46,19 +47,77 @@ class NsdSaeDataConfig(pydantic.BaseModel):
         preproc_dir = cache_dir / f"subj{self.subject_id:02d}_preprocessed_hdf5"
         return preproc_dir
     
-    def _get_roi_cache_filepath(self, roi) -> Path:
+    def _get_roi_cache_filepath(self, roi_id_name: str, roi_is_custom: bool) -> Path:
         """
-        Determines the standardized *base* cache file path for a given ROI.
+        Determines the standardized *base* cache file path for a given ROI identifier.
         The final fMRI and metadata cache files will derive from this base path.
+        
+        Args:
+            roi_id_name: The name/identifier for the ROI (e.g., 'V1' or 'my_custom_roi').
+            roi_is_custom: True if the ROI was passed as a raw array, influencing naming.
         """
         nsddata_path = Path(self.nsddata_path).resolve()
         cache_dir = nsddata_path / ".cache"
         cache_dir.mkdir(exist_ok=True)
-        roi_name = Path(roi).stem
-        # NOTE: We use .h5 as a *base* name to derive the .npy paths
-        cache_filename = f"subj{self.subject_id:02d}_roi-{roi_name}_offset{self.offset}.h5"
+        
+        # Use .h5 as a *base* name to derive the .npy paths
+        cache_filename = f"subj{self.subject_id:02d}_roi-{roi_id_name}_offset{self.offset}.h5"
         return cache_dir / cache_filename
     
+    @staticmethod
+    def _validate_roi_mask(roi_mask: np.ndarray, ref_roi_path: Path) -> None:
+        """
+        Checks if a given ROI mask is valid by comparing its shape to a reference 
+        ROI and ensuring its values are binary (0s and 1s).
+        
+        Raises:
+            ValueError: If the shape does not match or the ROI is not binary.
+        """
+        ref_roi_shape = nibabel.load(ref_roi_path, mmap=True).shape
+
+        # 2. Make sure shape matches
+        if roi_mask.shape != ref_roi_shape:
+            raise ValueError(f"ROI shape mismatch: Input ROI shape {roi_mask.shape} does not match reference shape {ref_roi_shape}.")
+
+        # 3. Make sure mask is binary (i.e., only contains 0 and 1)
+        unique_values = np.unique(roi_mask)
+        is_binary = np.all(np.isin(unique_values, [0, 1]))
+        
+        if not is_binary:
+            raise ValueError(f"ROI is not binary: Found unique values {unique_values}. Only 0 and 1 are allowed.")
+    
+    def _get_and_validate_roi_mask(self, roi: Union[str, np.ndarray]) -> np.ndarray:
+        """
+        Loads the ROI mask from path or validates the provided array.
+        
+        Args:
+            roi: Either a string path to a NIfTI file or a pre-loaded np.ndarray.
+            
+        Returns:
+            The flattened, binary, boolean ROI mask (np.ndarray of bools).
+        """
+        # The reference file for shape check is assumed to be a known, consistent file
+        ref_roi_path = Path(self.nsddata_path) / "nsddata/ppdata/subj01/func1pt8mm/roi/nsdgeneral.nii.gz"
+
+        if isinstance(roi, str) or isinstance(roi, Path):
+            # Case 1: ROI is a path to a NIfTI file
+            roi_path = Path(roi)
+            # Load the NIfTI data
+            roi_mask_data = nibabel.load(roi_path, mmap=True).get_fdata() > 0
+            # Validate the loaded data
+            self._validate_roi_mask(roi_mask_data, ref_roi_path)
+        elif isinstance(roi, np.ndarray):
+            # Case 2: ROI is a pre-loaded array
+            roi_mask_data = roi
+            # Validate the provided array
+            self._validate_roi_mask(roi_mask_data, ref_roi_path)
+        else:
+            raise TypeError("ROI must be a file path (str/Path) or a NumPy array (np.ndarray).")
+
+        # Binarize the data (True for voxels in the ROI, False otherwise) and flatten
+        roi_mask_flat = (roi_mask_data > 0).flatten()
+        return roi_mask_flat
+
     def _create_session_hdf5(self, session_filepath: Path, n_voxels: int, estimated_samples: int = 0):
         """Creates an extendable HDF5 file for a session"""
         with h5py.File(session_filepath, 'w') as f:
@@ -144,8 +203,8 @@ class NsdSaeDataConfig(pydantic.BaseModel):
                         print(f"A session processing task generated an exception: {exc}")
         
         print("All missing sessions have been preprocessed successfully.", flush=True)
-    
-    def generate_roi_cache(self, roi_base_path: Path, roi: Path, num_workers: int = None):
+
+    def generate_roi_cache(self, roi_base_path: Path, roi_mask_flat: np.ndarray, num_workers: Optional[int] = None):
         """
         Aggregates preprocessed full-brain data, applies the ROI mask, and saves
         the final, masked fMRI and metadata to .npy cache files.
@@ -160,22 +219,17 @@ class NsdSaeDataConfig(pydantic.BaseModel):
 
         print(f"Building ROI cache at {fmri_cache_path} and {meta_cache_path}", flush=True)
         preproc_dir = self._get_preproc_dir_path()
-        # Pass num_workers down to preprocess_full_brain
+
         self.preprocess_full_brain(preproc_dir, num_workers=num_workers)
         
-        # Load the ROI mask (NIfTI file)
-        roi_path = Path(roi)
-        # Binarize the NIfTI data: True for voxels in the ROI, False otherwise
-        roi_mask = nibabel.load(roi_path, mmap=True).get_fdata() > 0
-        roi_mask_flat = roi_mask.flatten() # Flatten to 1D boolean mask
         n_roi_voxels = roi_mask_flat.sum() # Total count of voxels in the ROI
-        
         print(f"ROI has {n_roi_voxels} voxels", flush=True)
         
         session_files = sorted(preproc_dir.glob("session_*.h5"))
         
         if num_workers is None:
             # Determine number of workers, e.g., number of CPUs available
+            # Note: os.cpu_count() might return None in restricted environments
             num_workers = min(len(session_files)//4, os.cpu_count() or 1)
         
         print(f"Processing {len(session_files)} sessions in parallel with {num_workers} workers...", flush=True)
@@ -184,17 +238,16 @@ class NsdSaeDataConfig(pydantic.BaseModel):
         fmri_chunks = []
         meta_chunks = []
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            # Submit all file processing tasks to the pool
             future_to_file = {executor.submit(_process_single_file, fp, roi_mask_flat): fp for fp in session_files}
             
             for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
                 try:
-                    # Retrieve the result (masked_fmri, metadata)
                     roi_fmri, metadata = future.result()
                     fmri_chunks.append(roi_fmri)
                     meta_chunks.append(metadata)
                 except Exception as exc:
-                    print(f'{future_to_file[future]} generated an exception: {exc}')
+                    print(f'{file_path} generated an exception: {exc}')
 
         print("Concatenating data from all workers...")
         final_fmri = np.concatenate(fmri_chunks, axis=0).astype(np.float32)
@@ -211,49 +264,81 @@ class NsdSaeDataConfig(pydantic.BaseModel):
 
         print(f"ROI cache created: {fmri_cache_path.parent}", flush=True)
     
-    def load_roi_NSDDataset(self, roi: str = "", return_fmri_only: bool = True, num_workers: int = None, local_file: str = "") -> NSDDataset:
+    def load_roi_NSDDataset(self, 
+                           roi: Union[str, Path, np.ndarray], 
+                           custom_name: str = None,
+                           return_fmri_only: bool = True, 
+                           num_workers: Optional[int] = None, 
+                           local_file: str = "") -> NSDDataset:
         """
         Primary interface to load the final PyTorch Dataset.
-        Handles cache creation, file copying (if local_file is provided), 
+        Handles ROI loading/validation, cache creation, file copying, 
         and initialization of the NSDDataset.
+        
+        Args:
+            roi: A path (str or Path) to a NIfTI ROI file, OR a pre-loaded np.ndarray 
+                 representing the 3D ROI mask.
+            custom_name: An optional string to use as the unique identifier in the 
+                         cache filename. If 'roi' is a path, its stem is used by default.
+                         If 'roi' is an array, 'custom_name' is REQUIRED.
+            return_fmri_only: Passed to NSDDataset.
+            num_workers: Number of workers for cache generation.
+            local_file: Local directory path for copying cache files.
         """
+        
+        # --- 1. Determine ROI Identifier and Type ---
+        roi_is_custom_array = isinstance(roi, np.ndarray)
+        if roi_is_custom_array:
+            if not custom_name:
+                raise ValueError("When 'roi' is a NumPy array, 'custom_name' must be provided for the cache file.")
+            roi_id_name = custom_name
+        else:
+            roi_path = Path(roi)
+            roi_id_name = roi_path.stem
+        
+        # --- 2. Load and Validate ROI Mask ---
+        # This will raise a ValueError if the ROI is invalid
+        roi_mask_flat = self._get_and_validate_roi_mask(roi)
+        
+        # --- 3. Get Cache Paths and Generate Cache ---
         img_path = Path(self.nsddata_path).resolve() / "nsd_stimuli.hdf5"
         
-        # Get the base path (e.g., .../cache.h5)
-        roi_base_cache_path = self._get_roi_cache_filepath(roi)
+        # Get the base path
+        roi_base_cache_path = self._get_roi_cache_filepath(roi_id_name, roi_is_custom_array)
         
         # This will create/load the .npy cache files
-        self.generate_roi_cache(roi_base_cache_path, Path(roi), num_workers=num_workers)
+        self.generate_roi_cache(roi_base_cache_path, roi_mask_flat, num_workers=num_workers)
         
         # Derive the final .npy paths
         fmri_cache_path = roi_base_cache_path.with_suffix(".fmri.npy")
         meta_cache_path = roi_base_cache_path.with_suffix(".meta.npy")
 
-        # Logic from the second version to copy files locally
-        if local_file != "":
+        # --- 4. Handle Local File Copying ---
+        current_fmri_path = fmri_cache_path
+        current_meta_path = meta_cache_path
+        
+        if local_file:
             print(f"Copying files to local disk ({local_file}).", flush=True)
-            
-            # Define Local Paths
             LOCAL_DIR = Path(local_file)
             LOCAL_DIR.mkdir(exist_ok=True)
             
-            fmri_cache_path_local = LOCAL_DIR / fmri_cache_path.name
-            meta_cache_path_local = LOCAL_DIR / meta_cache_path.name
+            fmri_cache_path_local = LOCAL_DIR / current_fmri_path.name
+            meta_cache_path_local = LOCAL_DIR / current_meta_path.name
 
             if not fmri_cache_path_local.exists():
-                shutil.copy(fmri_cache_path, fmri_cache_path_local)
+                shutil.copy(current_fmri_path, fmri_cache_path_local)
 
             if not meta_cache_path_local.exists():
-                shutil.copy(meta_cache_path, meta_cache_path_local)
+                shutil.copy(current_meta_path, meta_cache_path_local)
             
             # Update the paths to the local copies for the Dataset initializer
-            fmri_cache_path = fmri_cache_path_local
-            meta_cache_path = meta_cache_path_local
+            current_fmri_path = fmri_cache_path_local
+            current_meta_path = meta_cache_path_local
         
-        # Dataset uses memory-mapping internally
+        # --- 5. Initialize Dataset ---
         return NSDDataset(
-            fmri_cache_path=fmri_cache_path,
-            meta_cache_path=meta_cache_path,
+            fmri_cache_path=current_fmri_path,
+            meta_cache_path=current_meta_path,
             img_path=img_path,
             return_fmri_only=return_fmri_only
         )
@@ -262,7 +347,7 @@ def _process_single_session(session_num: int, config: 'NsdSaeDataConfig', prepro
     """
     Processes all fMRI runs for a single session: loads, cleans, applies
     time-shift (offset), generates metadata, and saves the result to a
-    session-specific HDF5 file. (Function outside the class for multiprocessing)
+    session-specific HDF5 file.
     """
     
     session_filepath = preproc_dir / f"session_{session_num:02d}.h5"
@@ -340,11 +425,11 @@ def _process_single_session(session_num: int, config: 'NsdSaeDataConfig', prepro
 def _process_single_file(session_filepath: Path, roi_mask_flat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Loads one full-brain session HDF5 file, applies the ROI mask, and returns
-    only the fMRI data and metadata for the ROI. (Function outside the class for multiprocessing)
+    only the fMRI data and metadata for the ROI.
     """
     with h5py.File(session_filepath, 'r') as src:
         fmri_full_session = src['fmri'][:]
-        metadata_full_session = src['metadata'][:]
+        metadata_full_session = src['metadata']
         
         # Apply ROI mask in memory
         roi_fmri = fmri_full_session[:, roi_mask_flat]
