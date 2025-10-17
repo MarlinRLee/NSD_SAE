@@ -429,7 +429,7 @@ def _process_single_file(session_filepath: Path, roi_mask_flat: np.ndarray) -> t
     """
     with h5py.File(session_filepath, 'r') as src:
         fmri_full_session = src['fmri'][:]
-        metadata_full_session = src['metadata']
+        metadata_full_session = src['metadata'][:]
         
         # Apply ROI mask in memory
         roi_fmri = fmri_full_session[:, roi_mask_flat]
