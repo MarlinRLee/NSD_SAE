@@ -1,8 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this tree.
 import typing as tp
 from pathlib import Path
 import numpy as np
@@ -16,26 +11,34 @@ class NSDDataset(torch.utils.data.Dataset):
     """
     A PyTorch Dataset for loading preprocessed NSD fMRI and stimulus data.
 
-    Utilizes memory-mapping (mmap) for fMRI data for highly efficient,
-    process-safe, and low-RAM access across multiple data workers.
+    Uses lazy, memory-mapped loading for fMRI data for highly efficient,
+    process-safe access across multiple data workers.
     """
     def __init__(self, fmri_cache_path: Path, meta_cache_path: Path, img_path: Path, return_fmri_only: bool = True, verbose = True):
+        # Store paths
+        self.fmri_cache_path = fmri_cache_path
+        self.meta_cache_path = meta_cache_path
         self.stimuli_path = img_path
         self.return_fmri_only = return_fmri_only
 
-        # Load data using memory-mapping
-        self.fmri_data = np.load(fmri_cache_path, mmap_mode='r')
-        
-        # Metadata is small, just load it into RAM
+        # The actual memory-mapped data will be loaded in the worker processes
+        self.fmri_data = None  # Will be loaded on first __getitem__ call in each worker
+        self.voxel_dim = None
+
+        # Load metadata in the main process (it's small and process-safe)
         # allow_pickle=True is needed for structured arrays
-        self.metadata = np.load(meta_cache_path, allow_pickle=True)
+        self.metadata = np.load(self.meta_cache_path, allow_pickle=True)
         
-        self._length = self.fmri_data.shape[0]  # Total number of samples (TRs)
-        self.voxel_dim = self.fmri_data.shape[1] # Number of voxels in the ROI
+        self._length = self.metadata.shape[0]  # Total number of samples (TRs)
         
         if verbose:
-            print(f"Dataset initialized with {self._length} samples", flush=True)
-            print(f"Voxel count per sample: {self.fmri_data.shape[1]}", flush=True)
+            print(f"Dataset initialized with {self._length} samples (fMRI data will be loaded lazily).", flush=True)
+
+    def _load_fmri_data(self):
+        """Helper to load fmri data using memory-mapping, only called once per process."""
+        if self.fmri_data is None:
+            self.fmri_data = np.load(self.fmri_cache_path, mmap_mode='r')
+            self.voxel_dim = self.fmri_data.shape[1]
     
     def change_return_type(self, return_fmri_only: bool):
         """Allows switching the return format (fMRI only vs. fMRI + metadata)."""
@@ -48,21 +51,11 @@ class NSDDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> tp.Union[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Retrieves one sample (TR) from the dataset.
-
-        Args:
-            idx: Index of the sample (TR).
-
-        Returns:
-            fMRI tensor or a dictionary of fMRI tensor and metadata tensors.
-        or if return_fmri_only is false it returns a dict with keys:
-            "fmri": fMRI tensor
-            "stimulus_history": last n images seen before this timestep
-            "subject_idx": what subject the data is from
-            "session": what session the sample is from
-            "run": what run in the session the sample is from
-            "time": what time in the run the sample is from
         """
-
+        # Load the fMRI data if it hasn't been loaded in this process/worker yet
+        if self.fmri_data is None:
+            self._load_fmri_data()
+            
         fmri_tensor = torch.from_numpy(self.fmri_data[idx])
         
         if self.return_fmri_only:
@@ -78,7 +71,7 @@ class NSDDataset(torch.utils.data.Dataset):
             "run": torch.tensor(metadata['run'], dtype=torch.long),
             "time": torch.tensor(metadata['time'], dtype=torch.float),
         }
-    
+
     def __get_image__(self, idx: int) -> Image.Image:
         """
         Special method to retrieve a PIL image from the main NSD HDF5 file.
@@ -88,6 +81,7 @@ class NSDDataset(torch.utils.data.Dataset):
         NOTE: 'idx' here is the **image ID (stimulus_history value)**, not the sample index.
         """
         if idx != -1:
+            # File is opened and closed for each callg
             with h5py.File(self.stimuli_path, 'r') as stim_file:
                 img_brick = stim_file['imgBrick']
                 image_data = img_brick[idx]
@@ -121,9 +115,11 @@ class NSDDataset(torch.utils.data.Dataset):
     def get_sequence_item(self, idx: int) -> tp.Optional[dict[str, torch.Tensor]]:  
         """
         Finds the full 6-sample fMRI sequence (TRs) and corresponding image for a given target timestep index (`idx`). 
-        This is mainly meant to extract the corresponding dynadiff sample.
         """
-       
+        # Ensure data is loaded for sequence retrieval as well
+        if self.fmri_data is None:
+            self._load_fmri_data()
+
         if not (0 <= idx < len(self)):
             raise IndexError("Index out of range.")
         
@@ -195,10 +191,11 @@ class NSDDataset(torch.utils.data.Dataset):
 
     def close(self):
         """Safely close any open memory-map handles to release resources."""
-        # Check if fmri_data and its _mmap attribute exist and are not None
-        if hasattr(self, 'fmri_data') and hasattr(self.fmri_data, '_mmap') and self.fmri_data._mmap:
+        # Only close if the data was actually loaded
+        if self.fmri_data is not None and hasattr(self.fmri_data, '_mmap') and self.fmri_data._mmap:
             self.fmri_data._mmap.close()
             self.fmri_data._mmap = None
+            self.fmri_data = None # Clear reference
 
     def __del__(self):
         """Ensure file handles are closed when the object is deleted."""
