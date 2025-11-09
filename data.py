@@ -112,6 +112,31 @@ class NSDDataset(torch.utils.data.Dataset):
         
         return img
 
+    def __get_recent_image__(self, idx: int) -> Image.Image:
+            """
+            Retrieves the PIL image for the most recently seen stimulus at a given sample index.
+
+            Args:
+                idx: The sample index (TR) to query.
+            
+            Returns:
+                Image.Image: The corresponding PIL image. Returns a "no seen image" 
+                             placeholder if the most recent stimulus ID is -1.
+            """
+            # 1. Get the metadata for the requested sample index
+            if not (0 <= idx < len(self)):
+                raise IndexError("Index out of range.")
+                
+            metadata = self.metadata[idx]
+            
+            # 2. Get the stimulus history from the metadata
+            stimulus_history = metadata['stimulus_history']
+            
+            # 3. The most recent image ID is the last one in the history array
+            recent_image_id = stimulus_history[-1]
+            
+            return self.__get_image__(recent_image_id)
+
     def get_sequence_item(self, idx: int) -> tp.Optional[dict[str, torch.Tensor]]:  
         """
         Finds the full 6-sample fMRI sequence (TRs) and corresponding image for a given target timestep index (`idx`). 
